@@ -29,6 +29,7 @@ sys.path.insert(0, str(THIS_DIR.parent))
 import torch  # noqa: E402
 
 from cusp.aggregate import (  # noqa: E402
+    aggregate_pairwise_cosines,
     insertion_plan,
     pearson,
     per_position_score,
@@ -41,6 +42,7 @@ from cusp.compat import check_compatibility, render_compat_markdown  # noqa: E40
 from cusp.conflict import (  # noqa: E402
     compute_module_conflict,
     expert_full_model_norms,
+    pairwise_cosines,
 )
 from cusp.io import (  # noqa: E402
     Config,
@@ -175,6 +177,7 @@ def main(argv: list[str] | None = None) -> int:
         _log(f"smoke test: scoring only the first {L} layers")
 
     module_conflicts: dict[tuple[int, str], Any] = {}
+    cosines_by_module: dict[tuple[int, str], dict[str, float]] = {}
     _log(f"scoring {L} layers × {len(cfg.modules)} modules "
          f"= {L * len(cfg.modules)} (layer, module) pairs")
     for layer in range(L):
@@ -197,6 +200,8 @@ def main(argv: list[str] | None = None) -> int:
                 eps=cfg.score.eps,
             )
             module_conflicts[(layer, m)] = mc
+            # Same deltas, free diagnostic.
+            cosines_by_module[(layer, m)] = pairwise_cosines(deltas)
             del base_t, deltas
         if layer % 4 == 0:
             _log(f"  scored layer {layer}/{L - 1}")
@@ -204,6 +209,26 @@ def main(argv: list[str] | None = None) -> int:
     _dump_json(
         {f"{l}/{m}": mc.to_dict() for (l, m), mc in module_conflicts.items()},
         outdir / "module_conflicts.json",
+    )
+
+    # Pairwise cosine diagnostic — "is any expert just noise?"
+    cos_summary = aggregate_pairwise_cosines(
+        cosines_by_module,
+        expert_roles=[e.role for e in cfg.experts],
+        modules=cfg.modules,
+        num_layers=L,
+        module_families=cfg.module_families,
+    )
+    _dump_json(
+        {
+            "per_module_raw": {
+                f"{l}/{m}": v for (l, m), v in cosines_by_module.items()
+            },
+            "per_pair_global_mean": cos_summary["per_pair_global_mean"],
+            "per_pair_per_layer": cos_summary["per_pair_per_layer"],
+            "per_pair_per_family": cos_summary["per_pair_per_family"],
+        },
+        outdir / "pairwise_cosines.json",
     )
 
     # ---- 5. standardise + aggregate to per-position ----
@@ -292,6 +317,7 @@ def main(argv: list[str] | None = None) -> int:
             full_norms=full_norms,
             module_conflicts=module_conflicts,
             diag=diag,
+            cos_summary=cos_summary,
         )
     )
     _log(f"wrote {summary_path}")
@@ -313,6 +339,7 @@ def _render_summary(
     full_norms: list[float],
     module_conflicts: dict[tuple[int, str], Any],
     diag: dict,
+    cos_summary: dict,
 ) -> str:
     out: list[str] = []
     out.append(f"# CUSP Phase 1 — `{cfg.name}`")
@@ -342,6 +369,46 @@ def _render_summary(
                        "See `compat_report.md` for the per-field breakdown.")
     else:
         out.append("- (skipped)")
+    out.append("")
+
+    # Pairwise expert-delta cosines.
+    out.append("## Pairwise expert cosines — is any expert noise?")
+    out.append("")
+    out.append("After unit-norm normalisation, the cosine between two "
+               "experts' deltas at a (layer, module) site tells us whether "
+               "their body-module changes have shared direction (>0), "
+               "opposite direction (<0), or random / orthogonal (~0). An "
+               "expert whose pairwise cosines hover around zero everywhere "
+               "is essentially noise; one with systematic non-zero values "
+               "contributes real geometric structure, even if its raw ‖Δ‖ "
+               "is small.")
+    out.append("")
+    out.append("| pair | global mean cos | attention | ffn |")
+    out.append("|------|-----------------|-----------|-----|")
+    fam_means = cos_summary.get("per_pair_per_family", {})
+    for label, v in cos_summary["per_pair_global_mean"].items():
+        fam = fam_means.get(label, {})
+        attn = fam.get("attention", float("nan"))
+        ffn = fam.get("ffn", float("nan"))
+        out.append(f"| {label} | {v:+.4f} | {attn:+.4f} | {ffn:+.4f} |")
+    out.append("")
+    out.append("Per-layer mean cosine sparklines (one row per pair):")
+    out.append("")
+    out.append("```")
+    for label, per_layer in cos_summary["per_pair_per_layer"].items():
+        sparkline = position_score_curve(per_layer)
+        first = per_layer[0] if per_layer else 0.0
+        last = per_layer[-1] if per_layer else 0.0
+        out.append(f"{label:>20s} : {sparkline}   "
+                   f"[L0={first:+.3f}, L{len(per_layer)-1}={last:+.3f}]")
+    out.append("```")
+    out.append("")
+    out.append("Reading: pairs with |global mean cos| ≥ 0.05 carry real "
+               "structure; pairs with |global mean cos| < 0.02 across both "
+               "module families are statistically consistent with noise. "
+               "Negative values mean the two experts pull the same module "
+               "in opposite directions — that is the geometric signature of "
+               "parameter conflict.")
     out.append("")
 
     # Agreement vs weight-norm baseline.

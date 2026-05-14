@@ -97,6 +97,41 @@ def compute_module_conflict(
     )
 
 
+# ---------------------------------------------- pairwise cosine diagnostic
+
+
+def pairwise_cosines(deltas: list[torch.Tensor]) -> dict[str, float]:
+    """Cosine similarity between every ordered pair (i, j) with i < j.
+
+    Keyed as "{i}_{j}" using positional indices into `deltas`. Callers map
+    positional indices back to expert roles upstream.
+
+    A near-zero pairwise cosine over many (layer, module) pairs is the
+    signature of "this expert is noise" — an expert whose body-module
+    direction is essentially random under the unit-norm normalisation will
+    show cos ≈ 0 with the other experts at almost every site. Systematic
+    non-zero values (positive or negative) indicate real geometric
+    structure, even if the absolute delta magnitude is small.
+    """
+    K = len(deltas)
+    out: dict[str, float] = {}
+    if K < 2:
+        return out
+    flat = [d.reshape(-1).float() for d in deltas]
+    # Inline norms in fp32 for the same reason we compute D in fp32 — bf16
+    # underflow on small deltas (Instruct) makes pairwise cosines unreliable.
+    norms = [float((f * f).sum().sqrt().item()) for f in flat]
+    for i in range(K):
+        for j in range(i + 1, K):
+            denom = norms[i] * norms[j]
+            if denom > 0.0:
+                dot = float((flat[i] * flat[j]).sum().item())
+                out[f"{i}_{j}"] = dot / denom
+            else:
+                out[f"{i}_{j}"] = 0.0
+    return out
+
+
 # --------------------------------------------------------------------- helper
 
 

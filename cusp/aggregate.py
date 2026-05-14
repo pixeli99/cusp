@@ -199,6 +199,94 @@ def topk_overlap(x: list[float], y: list[float], k: int) -> dict:
     }
 
 
+# -------------------------------------- pairwise-cosine aggregation
+
+
+def aggregate_pairwise_cosines(
+    cos_by_module: Mapping[tuple[int, str], Mapping[str, float]],
+    expert_roles: list[str],
+    modules: list[str],
+    num_layers: int,
+    module_families: Mapping[str, list[str]] | None = None,
+) -> dict:
+    """Aggregate pairwise cosines from per-(layer, module) into the three
+    views the summary needs:
+
+    - per-pair global mean over all (layer, module) sites
+    - per-pair per-layer mean (averaged over modules at each layer)
+    - per-pair per-family mean (attention vs FFN)
+
+    The output keys are role-name pairs like "code_math" so the summary is
+    self-explanatory without going back to positional indices.
+    """
+    K = len(expert_roles)
+    pair_keys: list[tuple[int, int, str]] = []
+    for i in range(K):
+        for j in range(i + 1, K):
+            pair_keys.append((i, j, f"{expert_roles[i]}_{expert_roles[j]}"))
+
+    global_sum = {label: 0.0 for _, _, label in pair_keys}
+    global_n = {label: 0 for _, _, label in pair_keys}
+    per_layer_sum: dict[str, list[float]] = {
+        label: [0.0] * num_layers for _, _, label in pair_keys
+    }
+    per_layer_n: dict[str, list[int]] = {
+        label: [0] * num_layers for _, _, label in pair_keys
+    }
+    per_family_sum: dict[str, dict[str, float]] = {}
+    per_family_n: dict[str, dict[str, int]] = {}
+    family_of: dict[str, str] = {}
+    if module_families:
+        for fam, ms in module_families.items():
+            for m in ms:
+                family_of[m] = fam
+        for _, _, label in pair_keys:
+            per_family_sum[label] = {fam: 0.0 for fam in module_families}
+            per_family_n[label] = {fam: 0 for fam in module_families}
+
+    for (layer, m), pair_cos in cos_by_module.items():
+        for i, j, label in pair_keys:
+            ikey = f"{i}_{j}"
+            if ikey not in pair_cos:
+                continue
+            v = float(pair_cos[ikey])
+            global_sum[label] += v
+            global_n[label] += 1
+            if 0 <= layer < num_layers:
+                per_layer_sum[label][layer] += v
+                per_layer_n[label][layer] += 1
+            fam = family_of.get(m)
+            if fam is not None and module_families:
+                per_family_sum[label][fam] += v
+                per_family_n[label][fam] += 1
+
+    global_mean = {
+        label: (global_sum[label] / global_n[label]) if global_n[label] else 0.0
+        for _, _, label in pair_keys
+    }
+    per_layer_mean: dict[str, list[float]] = {}
+    for _, _, label in pair_keys:
+        per_layer_mean[label] = [
+            (per_layer_sum[label][l] / per_layer_n[label][l])
+            if per_layer_n[label][l] > 0 else 0.0
+            for l in range(num_layers)
+        ]
+    per_family_mean: dict[str, dict[str, float]] = {}
+    if module_families:
+        for _, _, label in pair_keys:
+            per_family_mean[label] = {
+                fam: (per_family_sum[label][fam] / per_family_n[label][fam])
+                if per_family_n[label][fam] > 0 else 0.0
+                for fam in module_families
+            }
+
+    return {
+        "per_pair_global_mean": global_mean,
+        "per_pair_per_layer": per_layer_mean,
+        "per_pair_per_family": per_family_mean,
+    }
+
+
 # ------------------------------------------------------- visualisation
 
 

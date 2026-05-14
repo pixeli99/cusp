@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch  # noqa: E402
 
 from cusp.aggregate import (  # noqa: E402
+    aggregate_pairwise_cosines,
     insertion_plan,
     pearson,
     per_position_score,
@@ -28,7 +29,11 @@ from cusp.aggregate import (  # noqa: E402
     standardise_within_scope,
     topk_overlap,
 )
-from cusp.conflict import ModuleConflict, compute_module_conflict  # noqa: E402
+from cusp.conflict import (  # noqa: E402
+    ModuleConflict,
+    compute_module_conflict,
+    pairwise_cosines,
+)
 
 
 def approx(a: float, b: float, tol: float = 1e-5) -> bool:
@@ -222,6 +227,54 @@ def test_topk_overlap_partial() -> None:
     assert approx(r["jaccard"], 1 / 5, tol=1e-9)
 
 
+# ----------------------------------------------------- pairwise cosines
+
+
+def test_pairwise_cosines_identical() -> None:
+    a = torch.randn(32, 16)
+    out = pairwise_cosines([a, a, a])
+    assert approx(out["0_1"], 1.0, tol=1e-5)
+    assert approx(out["0_2"], 1.0, tol=1e-5)
+    assert approx(out["1_2"], 1.0, tol=1e-5)
+
+
+def test_pairwise_cosines_orthogonal() -> None:
+    a = torch.zeros(4, 4); a[0, 0] = 1.0
+    b = torch.zeros(4, 4); b[1, 1] = 1.0
+    out = pairwise_cosines([a, b])
+    assert approx(out["0_1"], 0.0, tol=1e-7)
+
+
+def test_pairwise_cosines_antiparallel() -> None:
+    a = torch.randn(8, 8)
+    out = pairwise_cosines([a, -a])
+    assert approx(out["0_1"], -1.0, tol=1e-5)
+
+
+def test_aggregate_pairwise_cosines_layer_and_family() -> None:
+    # Two layers, two modules, two experts. Hand-set values so we know
+    # the expected aggregates exactly.
+    cos_by_mod = {
+        (0, "q_proj"):    {"0_1":  0.5},
+        (0, "down_proj"): {"0_1": -0.5},
+        (1, "q_proj"):    {"0_1":  0.5},
+        (1, "down_proj"): {"0_1": -0.5},
+    }
+    agg = aggregate_pairwise_cosines(
+        cos_by_mod,
+        expert_roles=["A", "B"],
+        modules=["q_proj", "down_proj"],
+        num_layers=2,
+        module_families={"attention": ["q_proj"], "ffn": ["down_proj"]},
+    )
+    assert approx(agg["per_pair_global_mean"]["A_B"], 0.0, tol=1e-9)
+    # Each layer averages 0.5 and -0.5 over modules -> 0.0.
+    assert agg["per_pair_per_layer"]["A_B"] == [0.0, 0.0]
+    fam = agg["per_pair_per_family"]["A_B"]
+    assert approx(fam["attention"], 0.5)
+    assert approx(fam["ffn"], -0.5)
+
+
 # -------------------------------------------------------------------- main
 
 
@@ -243,6 +296,10 @@ def main() -> int:
         test_topk_overlap_full_match,
         test_topk_overlap_disjoint,
         test_topk_overlap_partial,
+        test_pairwise_cosines_identical,
+        test_pairwise_cosines_orthogonal,
+        test_pairwise_cosines_antiparallel,
+        test_aggregate_pairwise_cosines_layer_and_family,
     ]
     failures = []
     for t in tests:
