@@ -1,0 +1,28 @@
+{
+  "name": "qwen2.5-1.5b",
+  "base": {
+    "repo": "Qwen/Qwen2.5-1.5B",
+    "revision": "main"
+  },
+  "experts": [
+    { "role": "code",     "repo": "Qwen/Qwen2.5-Coder-1.5B",   "revision": "main" },
+    { "role": "math",     "repo": "Qwen/Qwen2.5-Math-1.5B",    "revision": "main" },
+    { "role": "instruct", "repo": "Qwen/Qwen2.5-1.5B-Instruct","revision": "main" }
+  ],
+  "modules": ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "gate_proj", "down_proj"],
+  "module_families": {
+    "attention": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "ffn":       ["up_proj", "gate_proj", "down_proj"]
+  },
+  "score": {
+    "tau_mag_percentile": 0.5,
+    "expert_norm": "full_model_unit",
+    "module_zscore_scope": "module",
+    "eps": 1e-12
+  },
+  "position": {
+    "min_gap": 2,
+    "default_k": [7, 14]
+  },
+  "output_dir": "results/qwen2.5-1.5b"
+}
