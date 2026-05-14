@@ -30,9 +30,12 @@ import torch  # noqa: E402
 
 from cusp.aggregate import (  # noqa: E402
     insertion_plan,
+    pearson,
     per_position_score,
     position_score_curve,
+    spearman,
     standardise_within_scope,
+    topk_overlap,
 )
 from cusp.compat import check_compatibility, render_compat_markdown  # noqa: E402
 from cusp.conflict import (  # noqa: E402
@@ -256,7 +259,27 @@ def main(argv: list[str] | None = None) -> int:
         outdir / "weight_norm_saliency.json",
     )
 
-    # ---- 8. markdown summary ----
+    # ---- 8. agreement diagnostics: how much of CUSP is explained by WN? ----
+    _log("computing CUSP-vs-weight-norm agreement diagnostics")
+    diag = {
+        "spearman_full": spearman(P, P_wn),
+        "pearson_full": pearson(P, P_wn),
+        # Boundary positions are forced low by P_π construction and high by
+        # weight-norm because edge modules tend to have larger weights. The
+        # interior slice removes that effect and gives a fairer view of how
+        # redundant the two signals are where insertions actually happen.
+        "spearman_interior": spearman(P[1:-1], P_wn[1:-1]),
+        "pearson_interior": pearson(P[1:-1], P_wn[1:-1]),
+        "topk_overlap": {
+            str(k): topk_overlap(P, P_wn, k) for k in cfg.position.default_k
+        },
+        "topk_overlap_interior": {
+            str(k): topk_overlap(P[1:-1], P_wn[1:-1], k) for k in cfg.position.default_k
+        },
+    }
+    _dump_json(diag, outdir / "agreement_vs_weight_norm.json")
+
+    # ---- 9. markdown summary ----
     summary_path = outdir / "summary.md"
     summary_path.write_text(
         _render_summary(
@@ -268,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
             compat_reports=compat_reports,
             full_norms=full_norms,
             module_conflicts=module_conflicts,
+            diag=diag,
         )
     )
     _log(f"wrote {summary_path}")
@@ -288,6 +312,7 @@ def _render_summary(
     compat_reports: list,
     full_norms: list[float],
     module_conflicts: dict[tuple[int, str], Any],
+    diag: dict,
 ) -> str:
     out: list[str] = []
     out.append(f"# CUSP Phase 1 — `{cfg.name}`")
@@ -306,9 +331,48 @@ def _render_summary(
     if compat_reports:
         for r in compat_reports:
             mark = "✅" if r.passed else "❌"
-            out.append(f"- {mark} {r.expert_role}")
+            warn = " ⚠️" if r.has_warnings else ""
+            out.append(f"- {mark}{warn} {r.expert_role}")
+        if any(r.has_warnings for r in compat_reports):
+            out.append("")
+            out.append("Warnings are non-fatal — they cover config fields like "
+                       "`max_position_embeddings`, `rope_theta`, and "
+                       "`rms_norm_eps` that change inference behavior but not "
+                       "weight geometry, plus tokenizer added-token differences. "
+                       "See `compat_report.md` for the per-field breakdown.")
     else:
         out.append("- (skipped)")
+    out.append("")
+
+    # Agreement vs weight-norm baseline.
+    out.append("## Agreement with weight-norm baseline")
+    out.append("")
+    out.append("How much of the conflict score is already explained by raw "
+               "weight magnitude on the base? Spearman is rank-based and ignores "
+               "the scale difference between the two signals.")
+    out.append("")
+    out.append("| slice | Spearman | Pearson |")
+    out.append("|-------|----------|---------|")
+    out.append(f"| full (incl. boundary)   | {diag['spearman_full']:+.3f} | "
+               f"{diag['pearson_full']:+.3f} |")
+    out.append(f"| interior (drop π=0, π=L) | {diag['spearman_interior']:+.3f} | "
+               f"{diag['pearson_interior']:+.3f} |")
+    out.append("")
+    out.append("Reading: Spearman close to +1 means weight-norm already picks the "
+               "same positions; close to 0 means the two signals are essentially "
+               "independent; negative means CUSP systematically prefers what WN "
+               "deprioritises (this is what we want at the boundaries).")
+    out.append("")
+    for k_str, ov in diag["topk_overlap"].items():
+        out.append(f"- top-{k_str} (full): "
+                   f"{ov['shared_count']} / {ov['k']} shared, "
+                   f"intersection={ov['intersection']}, "
+                   f"CUSP-only={ov['x_only']}, WN-only={ov['y_only']}")
+    for k_str, ov in diag["topk_overlap_interior"].items():
+        out.append(f"- top-{k_str} (interior): "
+                   f"{ov['shared_count']} / {ov['k']} shared, "
+                   f"intersection={ov['intersection']}, "
+                   f"CUSP-only={ov['x_only']}, WN-only={ov['y_only']}")
     out.append("")
 
     # Position score curve

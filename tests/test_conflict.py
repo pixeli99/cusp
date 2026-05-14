@@ -22,8 +22,11 @@ import torch  # noqa: E402
 
 from cusp.aggregate import (  # noqa: E402
     insertion_plan,
+    pearson,
     per_position_score,
+    spearman,
     standardise_within_scope,
+    topk_overlap,
 )
 from cusp.conflict import ModuleConflict, compute_module_conflict  # noqa: E402
 
@@ -153,6 +156,72 @@ def test_insertion_plan_underfills_when_gap_too_tight() -> None:
     assert chosen == [0]
 
 
+# -------------------------------------------------- correlations + overlap
+
+
+def test_pearson_identical_is_one() -> None:
+    x = [1.0, 2.0, 3.0, 4.5, 7.1]
+    assert approx(pearson(x, x), 1.0, tol=1e-9)
+
+
+def test_pearson_negated_is_minus_one() -> None:
+    x = [1.0, 2.0, 3.0, 4.5, 7.1]
+    y = [-v for v in x]
+    assert approx(pearson(x, y), -1.0, tol=1e-9)
+
+
+def test_pearson_constant_is_nan() -> None:
+    x = [1.0, 2.0, 3.0]
+    y = [5.0, 5.0, 5.0]
+    assert math.isnan(pearson(x, y))
+
+
+def test_spearman_monotone_nonlinear_is_one() -> None:
+    # x and x ** 3 share the same rank order, so Spearman = 1 even though
+    # Pearson is < 1.
+    x = [-2.0, -1.0, 0.0, 1.0, 2.0, 3.0]
+    y = [xi ** 3 for xi in x]
+    assert approx(spearman(x, y), 1.0, tol=1e-9)
+    assert pearson(x, y) < 1.0
+
+
+def test_spearman_ties_share_average_rank() -> None:
+    # Two ties at rank 2.5 each.
+    x = [1.0, 2.0, 2.0, 4.0]
+    y = [10.0, 20.0, 20.0, 40.0]
+    # Same tied structure -> Spearman = 1.
+    assert approx(spearman(x, y), 1.0, tol=1e-9)
+
+
+def test_topk_overlap_full_match() -> None:
+    x = [5.0, 4.0, 3.0, 2.0, 1.0]
+    y = [50.0, 40.0, 30.0, 20.0, 10.0]
+    r = topk_overlap(x, y, k=3)
+    assert r["intersection"] == [0, 1, 2]
+    assert r["x_only"] == [] and r["y_only"] == []
+    assert r["jaccard"] == 1.0
+
+
+def test_topk_overlap_disjoint() -> None:
+    x = [5.0, 4.0, 0.0, 0.0]
+    y = [0.0, 0.0, 5.0, 4.0]
+    r = topk_overlap(x, y, k=2)
+    assert r["intersection"] == []
+    assert r["x_only"] == [0, 1]
+    assert r["y_only"] == [2, 3]
+    assert r["jaccard"] == 0.0
+
+
+def test_topk_overlap_partial() -> None:
+    x = [5.0, 4.0, 3.0, 2.0, 1.0]
+    y = [5.0, 1.0, 2.0, 3.0, 4.0]  # top-3 of y is [0, 4, 3]
+    r = topk_overlap(x, y, k=3)
+    assert r["intersection"] == [0]
+    assert sorted(r["x_only"]) == [1, 2]
+    assert sorted(r["y_only"]) == [3, 4]
+    assert approx(r["jaccard"], 1 / 5, tol=1e-9)
+
+
 # -------------------------------------------------------------------- main
 
 
@@ -166,6 +235,14 @@ def main() -> int:
         test_per_position_aggregation_boundary_halving,
         test_insertion_plan_respects_min_gap,
         test_insertion_plan_underfills_when_gap_too_tight,
+        test_pearson_identical_is_one,
+        test_pearson_negated_is_minus_one,
+        test_pearson_constant_is_nan,
+        test_spearman_monotone_nonlinear_is_one,
+        test_spearman_ties_share_average_rank,
+        test_topk_overlap_full_match,
+        test_topk_overlap_disjoint,
+        test_topk_overlap_partial,
     ]
     failures = []
     for t in tests:

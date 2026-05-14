@@ -25,8 +25,9 @@ from pathlib import Path
 from cusp.io import ModelState
 
 
-# Config fields that, if they differ, make delta arithmetic meaningless.
-CRITICAL_CONFIG_FIELDS = (
+# Fields that change weight tensor shapes or the meaning of which weight
+# belongs to which module. A mismatch here makes delta arithmetic invalid.
+FATAL_CONFIG_FIELDS = (
     "model_type",
     "hidden_size",
     "intermediate_size",
@@ -34,12 +35,18 @@ CRITICAL_CONFIG_FIELDS = (
     "num_attention_heads",
     "num_key_value_heads",
     "vocab_size",
-    "max_position_embeddings",
-    "rms_norm_eps",
-    "rope_theta",
-    "hidden_act",
-    "tie_word_embeddings",
     "head_dim",
+    "tie_word_embeddings",
+    "hidden_act",
+)
+
+# Fields that change inference behavior but do not change weight shapes or
+# weight geometry. A mismatch warrants a warning but does not invalidate
+# delta arithmetic on the projection modules CUSP scores.
+SOFT_CONFIG_FIELDS = (
+    "max_position_embeddings",
+    "rope_theta",
+    "rms_norm_eps",
 )
 
 
@@ -48,24 +55,31 @@ class CompatReport:
     base_repo: str
     expert_repo: str
     expert_role: str
+    # Hard failures.
     config_mismatches: list[tuple[str, object, object]] = field(default_factory=list)
-    tokenizer_vocab_match: bool = True
-    tokenizer_diff_keys: list[str] = field(default_factory=list)
     state_dict_missing_in_expert: list[str] = field(default_factory=list)
     state_dict_extra_in_expert: list[str] = field(default_factory=list)
     shape_mismatches: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = field(
         default_factory=list
     )
+    # Soft warnings.
+    config_warnings: list[tuple[str, object, object]] = field(default_factory=list)
+    tokenizer_vocab_match: bool = True
+    tokenizer_diff_keys: list[str] = field(default_factory=list)
 
     @property
     def passed(self) -> bool:
+        """Hard pass — delta arithmetic on body projections is valid."""
         return (
             not self.config_mismatches
-            and self.tokenizer_vocab_match
             and not self.state_dict_missing_in_expert
             and not self.state_dict_extra_in_expert
             and not self.shape_mismatches
         )
+
+    @property
+    def has_warnings(self) -> bool:
+        return bool(self.config_warnings) or not self.tokenizer_vocab_match
 
     def to_dict(self) -> dict:
         return {
@@ -73,8 +87,12 @@ class CompatReport:
             "expert_repo": self.expert_repo,
             "expert_role": self.expert_role,
             "passed": self.passed,
+            "has_warnings": self.has_warnings,
             "config_mismatches": [
                 {"field": f, "base": b, "expert": e} for f, b, e in self.config_mismatches
+            ],
+            "config_warnings": [
+                {"field": f, "base": b, "expert": e} for f, b, e in self.config_warnings
             ],
             "tokenizer_vocab_match": self.tokenizer_vocab_match,
             "tokenizer_diff_keys": self.tokenizer_diff_keys,
@@ -138,14 +156,21 @@ def check_compatibility(
         base_repo=base.repo, expert_repo=expert.repo, expert_role=expert_role
     )
 
-    # 1) Config.
-    for field_name in CRITICAL_CONFIG_FIELDS:
+    # 1) Config — fatal vs soft.
+    for field_name in FATAL_CONFIG_FIELDS:
         b_val = base.config.get(field_name)
         e_val = expert.config.get(field_name)
         if b_val is None and e_val is None:
             continue
         if b_val != e_val:
             report.config_mismatches.append((field_name, b_val, e_val))
+    for field_name in SOFT_CONFIG_FIELDS:
+        b_val = base.config.get(field_name)
+        e_val = expert.config.get(field_name)
+        if b_val is None and e_val is None:
+            continue
+        if b_val != e_val:
+            report.config_warnings.append((field_name, b_val, e_val))
 
     # 2) Tokenizer vocabulary.
     b_vocab, b_added = _read_tokenizer_vocab(base.local_dir)
@@ -197,11 +222,17 @@ def render_compat_markdown(reports: list[CompatReport]) -> str:
     for r in reports:
         out.append(f"## {r.expert_role} — `{r.expert_repo}`")
         out.append("")
-        out.append(f"- **passed:** {'✅' if r.passed else '❌'}")
+        mark = "✅" if r.passed else "❌"
+        warn = "  ⚠️  with warnings" if r.has_warnings else ""
+        out.append(f"- **passed:** {mark}{warn}")
         out.append(f"- base: `{r.base_repo}`")
         if r.config_mismatches:
-            out.append("- config mismatches:")
+            out.append("- fatal config mismatches:")
             for f, b, e in r.config_mismatches:
+                out.append(f"  - `{f}`: base=`{b}`, expert=`{e}`")
+        if r.config_warnings:
+            out.append("- soft config warnings (do not affect weight geometry):")
+            for f, b, e in r.config_warnings:
                 out.append(f"  - `{f}`: base=`{b}`, expert=`{e}`")
         if not r.tokenizer_vocab_match:
             out.append("- tokenizer differences:")

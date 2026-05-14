@@ -133,6 +133,75 @@ def insertion_plan(scores: list[float], k: int, min_gap: int) -> list[int]:
     return sorted(chosen)
 
 
+# --------------------------------------- agreement between scoring schemes
+
+
+def _average_ranks(values: list[float]) -> list[float]:
+    """Average-rank ordering of `values` (smallest gets rank 1; ties share
+    the average of the ranks they occupy)."""
+    n = len(values)
+    if n == 0:
+        return []
+    order = sorted(range(n), key=lambda i: values[i])
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        avg = (i + j) / 2.0 + 1.0  # convert to 1-indexed
+        for idx in order[i : j + 1]:
+            ranks[idx] = avg
+        i = j + 1
+    return ranks
+
+
+def pearson(x: list[float], y: list[float]) -> float:
+    """Pearson correlation. Returns NaN if either input has zero variance."""
+    n = len(x)
+    if n == 0 or n != len(y):
+        return float("nan")
+    mx = sum(x) / n
+    my = sum(y) / n
+    sxx = sum((xi - mx) ** 2 for xi in x)
+    syy = sum((yi - my) ** 2 for yi in y)
+    if sxx == 0.0 or syy == 0.0:
+        return float("nan")
+    sxy = sum((xi - mx) * (yi - my) for xi, yi in zip(x, y))
+    return sxy / (sxx ** 0.5 * syy ** 0.5)
+
+
+def spearman(x: list[float], y: list[float]) -> float:
+    """Spearman rank correlation, with average-rank handling of ties."""
+    return pearson(_average_ranks(x), _average_ranks(y))
+
+
+def topk_overlap(x: list[float], y: list[float], k: int) -> dict:
+    """For two scoring schemes over the same candidate set, return how many
+    of the top-k positions they share, and which ones.
+
+    Result includes the count, the Jaccard similarity over the top-k sets,
+    and the sorted intersection / each-only sets for the markdown summary.
+    """
+    if k <= 0 or not x:
+        return {"k": k, "intersection": [], "x_only": [], "y_only": [],
+                "shared_count": 0, "jaccard": 0.0}
+    top_x = set(sorted(range(len(x)), key=lambda i: -x[i])[:k])
+    top_y = set(sorted(range(len(y)), key=lambda i: -y[i])[:k])
+    inter = sorted(top_x & top_y)
+    return {
+        "k": k,
+        "intersection": inter,
+        "x_only": sorted(top_x - top_y),
+        "y_only": sorted(top_y - top_x),
+        "shared_count": len(inter),
+        "jaccard": len(inter) / len(top_x | top_y),
+    }
+
+
+# ------------------------------------------------------- visualisation
+
+
 def position_score_curve(P: list[float]) -> str:
     """ASCII sparkline of P_π for the markdown summary. Just makes the curve
     eye-checkable next to the per-position table."""
